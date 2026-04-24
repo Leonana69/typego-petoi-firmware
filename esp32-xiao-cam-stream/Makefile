@@ -1,5 +1,6 @@
 FQBN := esp32:esp32:XIAO_ESP32S3:PSRAM=opi
 SKETCH := .
+PORT := $(shell ls /dev/cu.usbmodem* 2>/dev/null | head -1)
 
 all: build
 
@@ -7,20 +8,21 @@ build:
 	arduino-cli compile --fqbn $(FQBN) $(SKETCH)
 
 flash:
-	-make close
-	@usbport=$$(ls /dev/cu.usbmodem* | head -1); \
-	if [ -z "$$usbport" ]; then \
-		echo "No USB port found"; \
-	else \
-		arduino-cli upload --fqbn $(FQBN) -p $$usbport $(SKETCH); \
-	fi
-	script -q /dev/null screen /dev/cu.usbmodem* 115200 | ts '[%H:%M:%.S]'
+	@if [ -z "$(PORT)" ]; then echo "No USB port found"; exit 1; fi
+	arduino-cli upload --fqbn $(FQBN) -p $(PORT) $(SKETCH)
 
-open:
-	@screen -r
+monitor:
+	@if [ -z "$(PORT)" ]; then echo "No USB port found"; exit 1; fi
+	arduino-cli monitor -p $(PORT) \
+		--config baudrate=115200 \
+		--config dtr=off --config rts=off
 
-close:
-	@echo "Closing screen"
-	@screen -X -S $$(screen -ls | grep Detached | awk '{print $$1}') quit
+# Fallback monitor using plain screen. Quit with Ctrl+A then K then y.
+screen:
+	@if [ -z "$(PORT)" ]; then echo "No USB port found"; exit 1; fi
+	screen $(PORT) 9600
 
-.PHONY: all build flash open close
+# Flash then immediately attach the monitor so you catch boot output.
+run: flash monitor
+
+.PHONY: all build flash monitor screen run
