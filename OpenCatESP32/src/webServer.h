@@ -10,6 +10,7 @@
 
 #include <map>
 #include <ArduinoJson.h>
+#include "wifiNetworks.h"
 
 // 网页服务器调试级别控制
 #define WEB_DEBUG_LEVEL 1               // 0=关闭, 1=错误, 2=警告, 3=信息, 4=详细
@@ -100,6 +101,10 @@ void sendUltrasonicData(int distance);
 void clearWebTask(String taskId);
 void checkConnectionHealth();
 void sendSocketResponse(uint8_t clientId, String message);
+
+// Parallel HTTP control surface (port 80). Reuses the dispatch globals
+// declared above; safe to include here because all relevant types are in scope.
+#include "httpServer.h"
 
 // 简单的 Base64 解码函数
 String base64Decode(String input) {
@@ -587,20 +592,84 @@ bool connectWifi(String ssid, String password, int maxRetries = 3)
 }
 
 #ifndef WIFI_MANAGER
-// 当未启用WIFI_MANAGER时，尝试读取并使用之前保存的WiFi信息连接
+// Scan nearby APs and connect to the first known network in range. Preference
+// follows KNOWN_NETWORKS declaration order (matches wifi_link.c semantics).
+bool connectKnownWifiNetwork()
+{
+  if (NUM_KNOWN_NETWORKS == 0) return false;
+
+  printToAllPorts("Scanning for known WiFi networks...");
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false,
+                            /*passive=*/false, /*max_ms_per_chan=*/300);
+  if (n <= 0) {
+    WEB_WARN_F("No APs found in scan");
+    WiFi.scanDelete();
+    return false;
+  }
+
+  int matchIdx = -1;
+  int matchRssi = 0;
+  for (size_t j = 0; j < NUM_KNOWN_NETWORKS && matchIdx < 0; j++) {
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == String(KNOWN_NETWORKS[j].ssid)) {
+        matchIdx = (int)j;
+        matchRssi = WiFi.RSSI(i);
+        break;
+      }
+    }
+  }
+  WiFi.scanDelete();
+
+  if (matchIdx < 0) {
+    WEB_WARN_F("No known network in range");
+    return false;
+  }
+
+  printToAllPorts(String("Matched known network: ") + KNOWN_NETWORKS[matchIdx].ssid +
+                  " RSSI=" + String(matchRssi));
+  return connectWifi(String(KNOWN_NETWORKS[matchIdx].ssid),
+                     String(KNOWN_NETWORKS[matchIdx].password));
+}
+
+static void finalizeWifiUp()
+{
+  printToAllPorts("Successfully connected Wifi to IP Address: " + WiFi.localIP().toString());
+  webSocket.begin();
+  webSocket.onEvent(handleWebSocketEvent);
+  WEB_INFO_F("WebSocket server started");
+  // HTTP server start is deferred to WebServerLoop() — starting here would
+  // consume heap that BLE's scan in initBluetoothModes() needs.
+  size_t freeHeapAfter = ESP.getFreeHeap();
+  WEB_INFO("Free heap after WiFi connection: ", freeHeapAfter);
+}
+
+// 当未启用WIFI_MANAGER时，先扫描已知网络；若没有匹配再回退到 NVS 中保存的凭据
 bool connectWifiFromStoredConfig()
 {
-  // 检查可用内存
   size_t freeHeap = ESP.getFreeHeap();
   WEB_INFO("Free heap before WiFi init: ", freeHeap);
-  
-  if (freeHeap < 50000) { // 如果可用内存少于50KB
+
+  if (freeHeap < 50000) {
     WEB_ERROR("Insufficient memory for WiFi initialization: ", freeHeap);
     return false;
   }
-  
+
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+
+  // 1) Compile-time known-networks list (preferred).
+  if (connectKnownWifiNetwork()) {
+    webServerConnected = true;
+    finalizeWifiUp();
+    return true;
+  }
+
+  // 2) NVS fallback: credentials previously stored via the `w%SSID%password`
+  //    serial command. Skip if the user never ran that.
+  if (!rebootForWifiManagerQ) {
+    WEB_WARN_F("No stored WiFi credentials to try");
+    return false;
+  }
 
   wifi_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
@@ -618,17 +687,8 @@ bool connectWifiFromStoredConfig()
   }
 
   webServerConnected = connectWifi(savedSsid, savedPassword);
-
   if (webServerConnected) {
-    printToAllPorts("Successfully connected Wifi to IP Address: " + WiFi.localIP().toString());
-    // 启动WebSocket服务器
-    webSocket.begin();
-    webSocket.onEvent(handleWebSocketEvent);
-    WEB_INFO_F("WebSocket server started");
-    
-    // 显示连接后的内存状态
-    size_t freeHeapAfter = ESP.getFreeHeap();
-    WEB_INFO("Free heap after WiFi connection: ", freeHeapAfter);
+    finalizeWifiUp();
   } else {
     WEB_ERROR_F("Timeout: Fail to connect web server!");
   }
@@ -660,6 +720,7 @@ void startWifiManager() {
     webSocket.begin();
     webSocket.onEvent(handleWebSocketEvent);
     WEB_INFO_F("WebSocket server started");
+    startHttpServer();
   } else {
     WEB_ERROR_F("Timeout: Fail to connect web server!");
   }
@@ -689,6 +750,14 @@ void resetWifiManager() {
 void WebServerLoop()
 {
   if (webServerConnected) {
+    // Start the HTTP server on the first loop tick after setup() — deferred so
+    // that BLE scan (initBluetoothModes) gets an uncluttered heap. startHttpServer()
+    // is idempotent (guards on httpTaskHandle) so calling every tick is free.
+    static bool httpStarted = false;
+    if (!httpStarted) {
+      startHttpServer();
+      httpStarted = true;
+    }
     webSocket.loop();
     
     // 监控BLE活动对WebSocket的影响

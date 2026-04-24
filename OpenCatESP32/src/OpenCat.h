@@ -688,10 +688,11 @@ void initRobot() {
     }
   }
 #else
-  if (rebootForWifiManagerQ)
-  {
-    connectWifiFromStoredConfig();
-  }
+  // Always attempt WiFi on boot: connectWifiFromStoredConfig() first scans for
+  // compile-time KNOWN_NETWORKS (see src/wifiNetworks.h) and only falls back to
+  // NVS credentials when `rebootForWifiManagerQ` is set (i.e. the user
+  // previously ran `w%SSID%password` over serial).
+  connectWifiFromStoredConfig();
 #endif
 #endif
 

@@ -13,6 +13,86 @@ This is the codebase for current-generation Petoi hardware. If you're on the old
 
 ---
 
+## HTTP Control API
+
+This fork adds an HTTP control layer (port 80) alongside the existing WebSocket (:81) server. Once the board connects to WiFi (see [shared WiFi config](../README.md#shared-wifi-configuration)), you can drive the robot with plain `curl`.
+
+### Quickstart
+
+```sh
+curl http://<robot-ip>/status                                   # board info
+curl http://<robot-ip>/skills                                   # live skill list
+curl -X POST http://<robot-ip>/up                               # stand up
+curl -X POST http://<robot-ip>/skill -d '{"name":"sit"}'        # sit
+curl -X POST http://<robot-ip>/skill -d '{"name":"wkF"}'        # walk forward
+curl -X POST http://<robot-ip>/rest                             # power down
+```
+
+### Endpoints
+
+| Method | Path | Body | What it does |
+|---|---|---|---|
+| `GET`  | `/status`  | — | `{model, ip, rssi, uptimeMs, busy, wsClients, freeHeap}` |
+| `GET`  | `/skills`  | — | Live `{postures:[], gaits:[], behaviors:[]}` read from firmware |
+| `POST` | `/skill`   | `{"name":"sit","arg":0}` | Run a named skill (`arg` optional, e.g. repeat count) |
+| `POST` | `/cmd`     | `{"raw":"ksit"}` or `{"token":"t","args":"10 -5"}` | Raw passthrough for any OpenCat token |
+| `POST` | `/move`    | `{"joints":[{"index":8,"angle":30}], "mode":"simultaneous"\|"sequential"}` | Move specific joints |
+| `POST` | `/tilt`    | `{"roll":10,"pitch":-5}` | Tilt the body |
+| `POST` | `/beep`    | `{"notes":[[60,4],[62,4]]}` | Play notes (MIDI number + duration) |
+| `POST` | `/gyro`    | `{}` | Toggle IMU-based balancing |
+| `POST` | `/speed`   | `{"delta":1}` or `{"delta":-2}` | Speed up / slow down |
+| `POST` | `/stop`, `/rest`, `/balance`, `/up`, `/zero` | — | Convenience wrappers → `/skill` |
+
+All POSTs return `{ok:true, token, cmd, durationMs, response}` on success, or `{ok:false, error:"busy"|"timeout"|"bad_request"}` with HTTP 4xx.
+
+### Skill library (Bittle, ~93 skills)
+
+Source of truth is `GET /skills` — it reads the firmware's `skillNameWithType[]` table at runtime, so if you rebuild for Nybble / Cub the list changes accordingly. The tables below are the Bittle set for quick reference.
+
+**Postures** — static poses (`period = 1`)
+
+| Name | What it does | Name | What it does |
+|---|---|---|---|
+| `balance`   | Neutral standing posture | `rest`    | Power servos down |
+| `up`        | Stand up from rest       | `sit`     | Sit on haunches |
+| `buttUp`    | Rear end up              | `str`     | Stretch |
+| `calib`     | Calibration pose         | `zero`    | All joints to zero |
+| `lifted`    | Pose when picked up      | `dropped` | Pose after drop |
+| `lnd`       | Landing posture          |           |   |
+
+**Gaits** — locomotion cycles (`period > 1`)
+
+| Family | Forward | Left turn | Arm-variant F | Arm-variant L |
+|---|---|---|---|---|
+| Walk              | `wkF`     | `wkL`     | `wkArmF`  | `wkArmL`  |
+| Trot              | `trF`     | `trL`     | `trArmF`  | `trArmL`  |
+| Vertical trot     | `vtF`     | `vtL`     | `vtArmF`  | —         |
+| Crawl             | `crF`     | `crL`     | `crArmF`  | `crArmL`  |
+| Gallop            | `gpF`     | `gpL`     | —         | —         |
+| Back-step / dash  | `bkF` `bk` `bdF` | `bkL` | `bkArmF`  | `bkArmL`  |
+| High walk         | `hlw`     | —         | —         | —         |
+| Jump gait         | `jpF`     | —         | —         | —         |
+| Carpet-optimized  | `carpetF` | `carpetL` | —         | —         |
+| Push              | `phF`     | `phL`     | —         | —         |
+| Lift              | `lftF`    | `lftL`    | —         | —         |
+
+**Behaviors** — one-shot expressions (`period < 0`)
+
+| Group | Skills |
+|---|---|
+| Head / greeting | `nd` (nod), `hds` (head shake), `hg` (hug), `hi`, `hsk` (handshake), `fiv` (high five), `clap`, `ck` (check), `cmh` (come here), `gdb` (goodbye) |
+| Emotes          | `ang` (angry), `hu` (hurt), `wh` (whine), `lucky`, `showOff`, `lpov`, `mw`, `snf` (sniff), `zz` (sleep), `chr` (chirp), `dg` (dog) |
+| Acrobatic       | `flip`, `flipD`, `flipF`, `jmp` (jump), `launch`, `rl` (roll), `rc`, `bf`, `bx` (box), `kc` (kick), `pu` / `pu1` (pushup), `scrh` (scratch), `tbl` (tumble), `ts` (taunt shake), `ff` (fist fight) |
+| Interaction     | `pick`, `pickD`, `pickF`, `put`, `putD`, `putF`, `toss`, `tossD`, `tossF`, `hunt`, `knock`, `pd`, `pee`, `dropRec` |
+
+### Caveats
+
+- **One command at a time.** HTTP and the built-in WebSocket share a single dispatch slot. A second request during motion returns `409 busy` — wait and retry.
+- **Blocking semantics.** POST `/skill` doesn't return until the skill finishes (or 30 s timeout). Fine for scripting; don't open dozens of parallel connections.
+- **Model-specific.** Names above are Bittle. Swap `#define BITTLE` for `NYBBLE` / `CUB` in `OpenCatESP32.ino` and rebuild — `GET /skills` will reflect the new set.
+
+---
+
 ## Hardware
 
 BiBoard is the control board for:
