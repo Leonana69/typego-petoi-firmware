@@ -25,7 +25,7 @@
 #define DOUBLE_INFRARED_DISTANCE  // for double distance sensor
 #define GESTURE                   // for Gesture module
 #define CAMERA                    // for Mu Vision camera
-#define QUICK_DEMO                // for quick demo
+// #define QUICK_DEMO                // disabled: autonomous sit/stand/beep driven by analog pin noise
 // #define ROBOT_ARM                 // for attaching head clip arm
 #include "src/OpenCat.h"
 
@@ -82,7 +82,7 @@ void loop() {
   //  //— read environment sensors (low level)
   readEnvironment();  // update the gyro data
   //  //— special behaviors based on sensor events
-  dealWithExceptions();  // low battery, fall over, lifted, etc.
+  // dealWithExceptions();  // disabled: autonomous IMU-driven reactions (pushed/knocked/lifted/flipped/freefall). Re-enable for fall recovery.
   if (!tQueue->cleared()) {
     tQueue->popTask();
   } else {
