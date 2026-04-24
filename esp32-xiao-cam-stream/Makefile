@@ -1,7 +1,10 @@
+FQBN := esp32:esp32:XIAO_ESP32S3:PSRAM=opi
+SKETCH := .
+
 all: build
 
 build:
-	idf.py build
+	arduino-cli compile --fqbn $(FQBN) $(SKETCH)
 
 flash:
 	-make close
@@ -9,10 +12,9 @@ flash:
 	if [ -z "$$usbport" ]; then \
 		echo "No USB port found"; \
 	else \
-		idf.py -p $$usbport flash; \
+		arduino-cli upload --fqbn $(FQBN) -p $$usbport $(SKETCH); \
 	fi
-	# screen /dev/cu.usbmodem*
-	script -q /dev/null screen /dev/cu.usbmodem* 9600 | ts '[%H:%M:%.S]'
+	script -q /dev/null screen /dev/cu.usbmodem* 115200 | ts '[%H:%M:%.S]'
 
 open:
 	@screen -r
@@ -21,4 +23,4 @@ close:
 	@echo "Closing screen"
 	@screen -X -S $$(screen -ls | grep Detached | awk '{print $$1}') quit
 
-.PHONY: build flash
+.PHONY: all build flash open close
