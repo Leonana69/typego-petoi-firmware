@@ -257,6 +257,23 @@ static void httpHandleTilt() {
   httpRunAndReply('t', args);
 }
 
+// POST /euler {"roll": <rad>, "pitch": <rad>} — yaw ignored (balance loop only
+// corrects roll/pitch). Emits "t 1 <pitch_deg> 2 <roll_deg>" so axis indices
+// match the firmware's T_TILT parser; angles clamped to int8_t (yprTilt range).
+static void httpHandleEuler() {
+  JsonDocument req;
+  if (deserializeJson(req, httpBody())) {
+    httpSendError(400, "bad_request", "invalid JSON");
+    return;
+  }
+  float rollRad = req["roll"] | 0.0f;
+  float pitchRad = req["pitch"] | 0.0f;
+  int rollDeg = constrain((int)lroundf(rollRad * RAD_TO_DEG), -127, 127);
+  int pitchDeg = constrain((int)lroundf(pitchRad * RAD_TO_DEG), -127, 127);
+  String args = "1 " + String(pitchDeg) + " 2 " + String(rollDeg);
+  httpRunAndReply('t', args);
+}
+
 static void httpHandleBeep() {
   JsonDocument req;
   if (deserializeJson(req, httpBody())) {
@@ -327,7 +344,7 @@ static void httpHandleOptions() {
 static void httpHandleRoot() {
   String body = String("Petoi ") + httpModelName() +
                 " HTTP control. Endpoints: GET /status, GET /skills, "
-                "POST /skill, POST /cmd, POST /move, POST /tilt, POST /beep, "
+                "POST /skill, POST /cmd, POST /move, POST /tilt, POST /euler, POST /beep, "
                 "POST /gyro, POST /speed, POST /stop, POST /rest, POST /balance, "
                 "POST /up, POST /zero";
   httpServer.send(200, "text/plain", body);
@@ -343,6 +360,7 @@ static void httpServerTask(void *) {
   httpServer.on("/cmd", HTTP_POST, httpHandleCmd);
   httpServer.on("/move", HTTP_POST, httpHandleMove);
   httpServer.on("/tilt", HTTP_POST, httpHandleTilt);
+  httpServer.on("/euler", HTTP_POST, httpHandleEuler);
   httpServer.on("/beep", HTTP_POST, httpHandleBeep);
   httpServer.on("/gyro", HTTP_POST, httpHandleGyro);
   httpServer.on("/speed", HTTP_POST, httpHandleSpeed);
