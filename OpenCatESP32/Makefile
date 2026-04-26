@@ -13,7 +13,7 @@ PORT ?= $(shell ls /dev/cu.SLAB_USBtoUART /dev/cu.usbserial-* /dev/cu.wchusbseri
 build:
 	arduino-cli compile --fqbn $(FQBN) --build-path $(BUILD) $(SKETCH)
 
-flash: build
+flash:
 	@test -n "$(PORT)" || { echo "error: no serial port detected. Plug in the board or set PORT=/dev/cu.xxx"; exit 1; }
 	arduino-cli upload --fqbn $(FQBN) --input-dir $(BUILD) -p $(PORT) $(SKETCH)
 
