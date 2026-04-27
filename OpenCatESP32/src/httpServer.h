@@ -376,10 +376,19 @@ static void runPidTick() {
   runHttpCommandBlocking('i', iArgs.c_str(), iArgs.length(), unused, 1000);
 }
 
-// POST /euler {"roll": <rad>, "pitch": <rad>} — yaw ignored.
+// Allowed input ranges for /euler. Pitch is asymmetric: rear squat hits
+// servo thermal limits hard past -0.2 rad, but front squat has more headroom.
+#define EULER_PITCH_MIN_RAD -0.2f
+#define EULER_PITCH_MAX_RAD 0.5f
+#define EULER_ROLL_ABS_RAD  0.4f
+#define EULER_YAW_ABS_RAD   1.0f
+#define EULER_YAW_CLAMP_DEG 50  // joint-0 (head pan) hardware-safe range
+
+// POST /euler {"roll": <rad>, "pitch": <rad>, "yaw": <rad>}
 // Roll uses the IMU balance loop via yprTilt[2] (direct write — no dispatch).
 // Pitch arms the PID task; this handler dispatches the initial open-loop pose
-// so the user sees motion immediately, then the PID continues at 20 Hz.
+// so the user sees motion immediately, then the PID continues at 5 Hz.
+// Yaw drives joint 0 (head pan) — positive = head left (ROS convention).
 static void httpHandleEuler() {
   JsonDocument req;
   if (deserializeJson(req, httpBody())) {
@@ -388,7 +397,31 @@ static void httpHandleEuler() {
   }
   float rollRad = req["roll"] | 0.0f;
   float pitchRad = req["pitch"] | 0.0f;
+  float yawRad = req["yaw"] | 0.0f;
+  if (pitchRad < EULER_PITCH_MIN_RAD || pitchRad > EULER_PITCH_MAX_RAD) {
+    char msg[80];
+    snprintf(msg, sizeof(msg), "pitch=%.3f out of range [%.2f, %.2f]",
+             pitchRad, EULER_PITCH_MIN_RAD, EULER_PITCH_MAX_RAD);
+    httpSendError(400, "out_of_range", msg);
+    return;
+  }
+  if (rollRad < -EULER_ROLL_ABS_RAD || rollRad > EULER_ROLL_ABS_RAD) {
+    char msg[80];
+    snprintf(msg, sizeof(msg), "roll=%.3f out of range [%.2f, %.2f]",
+             rollRad, -EULER_ROLL_ABS_RAD, EULER_ROLL_ABS_RAD);
+    httpSendError(400, "out_of_range", msg);
+    return;
+  }
+  if (yawRad < -EULER_YAW_ABS_RAD || yawRad > EULER_YAW_ABS_RAD) {
+    char msg[80];
+    snprintf(msg, sizeof(msg), "yaw=%.3f out of range [%.2f, %.2f]",
+             yawRad, -EULER_YAW_ABS_RAD, EULER_YAW_ABS_RAD);
+    httpSendError(400, "out_of_range", msg);
+    return;
+  }
   int rollDeg = constrain((int)lroundf(rollRad * RAD_TO_DEG), -127, 127);
+  int yawDeg = constrain((int)lroundf(yawRad * RAD_TO_DEG),
+                         -EULER_YAW_CLAMP_DEG, EULER_YAW_CLAMP_DEG);
 
   pitchTargetRad = pitchRad;
   pitchPidActive = (fabsf(pitchRad) > 0.01f);
@@ -399,7 +432,10 @@ static void httpHandleEuler() {
   yprTilt[2] = rollDeg;
 
   int openFold = eulerPitchToFoldDeg(pitchRad);
-  String iArgs = eulerJointArgs(openFold);
+  // Prepend joint 0 (head pan) for yaw. The `i`-token sets targetHead[0] and
+  // manualHeadQ=true so subsequent perform() iterations hold this angle. PID
+  // ticks dispatch only legs (8..15), so targetHead[0] persists between them.
+  String iArgs = "0 " + String(yawDeg) + " " + eulerJointArgs(openFold);
   httpRunAndReply('i', iArgs);
 }
 
