@@ -451,11 +451,16 @@ void startWebTask(String taskId)
 // 完成web任务
 void completeWebTask()
 {
-  if (!webTaskActive || currentWebTaskId == "") {
+  if (!webTaskActive) {
     return;
   }
 
-  if (webTasks.find(currentWebTaskId) != webTasks.end()) {
+  // The WebSocket path stores currentWebTaskId and tracks the task in
+  // webTasks; the HTTP path (httpServer.h) leaves currentWebTaskId empty and
+  // polls webTaskActive directly. Skip the WS-only bookkeeping in that case,
+  // but always fall through to clear the global flags so the HTTP poller
+  // unblocks instead of waiting for the 30s timeout.
+  if (currentWebTaskId != "" && webTasks.find(currentWebTaskId) != webTasks.end()) {
     WebTask &task = webTasks[currentWebTaskId];
     task.results.push_back(webResponse);
 
@@ -466,7 +471,7 @@ void completeWebTask()
       startWebTask(currentWebTaskId);
       return;
     }
-    
+
     // 所有命令执行完成
     task.status = "completed";
     task.endTime = millis();

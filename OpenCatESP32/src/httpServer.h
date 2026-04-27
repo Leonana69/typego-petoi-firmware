@@ -72,6 +72,37 @@ static bool runHttpCommandBlocking(char tk, const char *args, size_t argLen,
   return ok;
 }
 
+// True once /euler has set a non-zero pitch or roll. Cleared by
+// resetTiltIfActive(), which gait-bound dispatches (/nav, /skill) call so a
+// leftover lean from a prior /euler doesn't fight the gait.
+static bool tiltActive = false;
+
+// PID state for the closed-loop pitch task. Layered on top of the open-loop
+// fold from eulerPitchToFoldDeg(): bias = Kp*err + Ki*∫err + Kd*d_err in
+// degrees, added to the open-loop fold each tick. Active iff pitchPidActive.
+static volatile float pitchTargetRad = 0.0f;
+static volatile bool pitchPidActive = false;
+static volatile float pidKp = 0.5f;
+static volatile float pidKi = 0.1f;
+static volatile float pidKd = 0.0f;
+
+static void resetTiltIfActive() {
+  if (!tiltActive) return;
+  tiltActive = false;
+  pitchPidActive = false;
+  pitchTargetRad = 0.0f;
+  balanceSlope[1] = 1;
+  yprTilt[0] = yprTilt[1] = yprTilt[2] = 0;
+  // Wait briefly for any in-flight PID dispatch to release the slot. Without
+  // this the caller's own dispatch races PID and gets a 409 (busy).
+  unsigned long deadline = millis() + 250;
+  while (webTaskActive && (long)(millis() - deadline) < 0) {
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  // Knees don't need an explicit reset: the gait /skill being loaded next
+  // will overwrite all leg joints.
+}
+
 // --- Response helpers -------------------------------------------------------
 
 static void httpSendJson(int code, const String &body) {
@@ -136,6 +167,16 @@ static const char *httpModelName() {
 #endif
 }
 
+static void httpHandleVersion() {
+  JsonDocument doc;
+  doc["buildDate"] = __DATE__;
+  doc["buildTime"] = __TIME__;
+  doc["model"] = httpModelName();
+  String out;
+  serializeJson(doc, out);
+  httpSendJson(200, out);
+}
+
 static void httpHandleStatus() {
   JsonDocument doc;
   doc["model"] = httpModelName();
@@ -194,6 +235,7 @@ static void httpHandleSkill() {
     args += " ";
     args += String((int)req["arg"]);
   }
+  resetTiltIfActive();
   httpRunAndReply('k', args);
 }
 
@@ -257,9 +299,87 @@ static void httpHandleTilt() {
   httpRunAndReply('t', args);
 }
 
-// POST /euler {"roll": <rad>, "pitch": <rad>} — yaw ignored (balance loop only
-// corrects roll/pitch). Emits "t 1 <pitch_deg> 2 <roll_deg>" so axis indices
-// match the firmware's T_TILT parser; angles clamped to int8_t (yprTilt range).
+// Bittle balance posture: hips and knees rest at 29° (per `j` query). /euler
+// pins all 8 leg joints to absolute targets so leftover currentAdjust[] from
+// the IMU loop can't bake itself into the new posture.
+#define EULER_BALANCE_HIP 29
+#define EULER_BALANCE_KNEE 29
+#define EULER_PITCH_GAIN 1.5f      // joint deg of fold per deg of commanded pitch
+#define EULER_PITCH_CLAMP_DEG 30   // knee min ≈ EULER_BALANCE_KNEE - clamp = -1 → 0 in hardware
+
+// Signed open-loop fold: positive = front squat (head down), negative = rear.
+static int eulerPitchToFoldDeg(float pitchRad) {
+  return constrain((int)lroundf(pitchRad * RAD_TO_DEG * EULER_PITCH_GAIN),
+                   -EULER_PITCH_CLAMP_DEG, EULER_PITCH_CLAMP_DEG);
+}
+
+// Build the `i`-token argument string that pins all 8 leg joints for a given
+// signed fold. Front knees+hips fold for positive fold, rear for negative.
+static String eulerJointArgs(int foldDeg) {
+  int frontFold = max(0, foldDeg);
+  int rearFold = max(0, -foldDeg);
+  int frontKnee = EULER_BALANCE_KNEE - frontFold;
+  int rearKnee = EULER_BALANCE_KNEE - rearFold;
+  int frontHip = EULER_BALANCE_HIP - frontFold;
+  int rearHip = EULER_BALANCE_HIP + rearFold;
+  return "8 " + String(frontHip) + " 9 " + String(frontHip) +
+         " 10 " + String(rearHip) + " 11 " + String(rearHip) +
+         " 12 " + String(frontKnee) + " 13 " + String(frontKnee) +
+         " 14 " + String(rearKnee) + " 15 " + String(rearKnee);
+}
+
+// PID tick: runs from the HTTP server task's main loop (see httpServerTask)
+// rather than a separate FreeRTOS task. Sharing the HTTP task naturally
+// serializes PID dispatches with HTTP request dispatches — no contention on
+// webTaskActive, and no risk of starting a PID task that breaks scheduling.
+//
+// Reads ypr[1] (degrees, updated by IMU loop in skill.h:373) and dispatches
+// an `i`-token frame. CAUTION: do NOT write directly into skill->dutyAngles
+// — that pointer aliases into newCmd (skill.h:140), and concurrent writes
+// corrupt command parsing badly enough to crash the WiFi stack.
+#define PID_PERIOD_MS 200
+static unsigned long pidLastTickMs = 0;
+
+static void runPidTick() {
+  static float lastErrorDeg = 0;
+  static float integralDeg = 0;
+  static unsigned long lastTime = 0;
+
+  if (!pitchPidActive) {
+    lastErrorDeg = 0;
+    integralDeg = 0;
+    lastTime = millis();
+    return;
+  }
+
+  unsigned long now = millis();
+  float dt = lastTime == 0 ? (PID_PERIOD_MS / 1000.0f)
+                            : max(0.001f, (now - lastTime) / 1000.0f);
+  lastTime = now;
+
+  float currentDeg = ypr[1];
+  float targetDeg = pitchTargetRad * RAD_TO_DEG;
+  float errorDeg = targetDeg - currentDeg;
+  integralDeg += errorDeg * dt;
+  float iCap = EULER_PITCH_CLAMP_DEG / max((float)pidKi, 0.01f);
+  integralDeg = constrain(integralDeg, -iCap, iCap);
+  float derivDeg = (errorDeg - lastErrorDeg) / dt;
+  lastErrorDeg = errorDeg;
+
+  float biasDeg = pidKp * errorDeg + pidKi * integralDeg + pidKd * derivDeg;
+  int openFold = eulerPitchToFoldDeg(pitchTargetRad);
+  int totalFold = constrain((int)lroundf(openFold + biasDeg),
+                            -EULER_PITCH_CLAMP_DEG, EULER_PITCH_CLAMP_DEG);
+
+  String iArgs = eulerJointArgs(totalFold);
+  String unused;
+  runHttpCommandBlocking('i', iArgs.c_str(), iArgs.length(), unused, 1000);
+}
+
+// POST /euler {"roll": <rad>, "pitch": <rad>} — yaw ignored.
+// Roll uses the IMU balance loop via yprTilt[2] (direct write — no dispatch).
+// Pitch arms the PID task; this handler dispatches the initial open-loop pose
+// so the user sees motion immediately, then the PID continues at 20 Hz.
 static void httpHandleEuler() {
   JsonDocument req;
   if (deserializeJson(req, httpBody())) {
@@ -269,9 +389,75 @@ static void httpHandleEuler() {
   float rollRad = req["roll"] | 0.0f;
   float pitchRad = req["pitch"] | 0.0f;
   int rollDeg = constrain((int)lroundf(rollRad * RAD_TO_DEG), -127, 127);
-  int pitchDeg = constrain((int)lroundf(pitchRad * RAD_TO_DEG), -127, 127);
-  String args = "1 " + String(pitchDeg) + " 2 " + String(rollDeg);
-  httpRunAndReply('t', args);
+
+  pitchTargetRad = pitchRad;
+  pitchPidActive = (fabsf(pitchRad) > 0.01f);
+  tiltActive = pitchPidActive || (rollDeg != 0);
+  balanceSlope[1] = pitchPidActive ? 0 : 1;
+
+  yprTilt[1] = 0;
+  yprTilt[2] = rollDeg;
+
+  int openFold = eulerPitchToFoldDeg(pitchRad);
+  String iArgs = eulerJointArgs(openFold);
+  httpRunAndReply('i', iArgs);
+}
+
+static void httpSendPidJson() {
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["kp"] = pidKp;
+  doc["ki"] = pidKi;
+  doc["kd"] = pidKd;
+  doc["active"] = pitchPidActive;
+  doc["targetDeg"] = pitchTargetRad * RAD_TO_DEG;
+  doc["currentDeg"] = ypr[1];
+  String out;
+  serializeJson(doc, out);
+  httpSendJson(200, out);
+}
+
+static void httpHandlePidGet() { httpSendPidJson(); }
+
+static void httpHandlePidPost() {
+  JsonDocument req;
+  if (deserializeJson(req, httpBody())) {
+    httpSendError(400, "bad_request", "invalid JSON");
+    return;
+  }
+  if (!req["kp"].isNull()) pidKp = req["kp"].as<float>();
+  if (!req["ki"].isNull()) pidKi = req["ki"].as<float>();
+  if (!req["kd"].isNull()) pidKd = req["kd"].as<float>();
+  httpSendPidJson();
+}
+
+// POST /nav {"vx": <m/s>, "vy": <m/s>, "vyaw": <rad/s>}
+// Maps a body-frame velocity command to the closest gait skill. vy is ignored
+// — quadruped gaits in this firmware have no native lateral translation.
+// Magnitudes are only used as a dead-zone; speed is set separately via /speed.
+static void httpHandleNav() {
+  JsonDocument req;
+  if (deserializeJson(req, httpBody())) {
+    httpSendError(400, "bad_request", "invalid JSON");
+    return;
+  }
+  float vx = req["vx"] | 0.0f;
+  float vyaw = req["vyaw"] | 0.0f;
+
+  const float LIN_DEAD = 0.05f;
+  const float ANG_DEAD = 0.1f;
+  const char *skill;
+  if (fabsf(vx) < LIN_DEAD && fabsf(vyaw) < ANG_DEAD) {
+    skill = "balance";
+  } else if (vx > LIN_DEAD) {
+    skill = (vyaw > ANG_DEAD) ? "wkL" : (vyaw < -ANG_DEAD) ? "wkR" : "wkF";
+  } else if (vx < -LIN_DEAD) {
+    skill = (vyaw > ANG_DEAD) ? "bkL" : (vyaw < -ANG_DEAD) ? "bkR" : "bk";
+  } else {
+    skill = (vyaw > 0) ? "wkL" : "wkR";
+  }
+  resetTiltIfActive();
+  httpRunAndReply('k', String(skill));
 }
 
 static void httpHandleBeep() {
@@ -328,11 +514,13 @@ static void httpHandleSpeed() {
   else httpSendError(409, "busy_or_timeout");
 }
 
-static void httpHandleStop()    { httpRunAndReply('k', "rest"); }
-static void httpHandleRest()    { httpRunAndReply('k', "rest"); }
-static void httpHandleBalance() { httpRunAndReply('k', "balance"); }
-static void httpHandleUp()      { httpRunAndReply('k', "up"); }
-static void httpHandleZero()    { httpRunAndReply('k', "zero"); }
+// Convenience skill-load handlers — must reset tilt state so PID stops
+// dispatching `i`-tokens that would override the recovery posture.
+static void httpHandleStop()    { resetTiltIfActive(); httpRunAndReply('k', "rest"); }
+static void httpHandleRest()    { resetTiltIfActive(); httpRunAndReply('k', "rest"); }
+static void httpHandleBalance() { resetTiltIfActive(); httpRunAndReply('k', "balance"); }
+static void httpHandleUp()      { resetTiltIfActive(); httpRunAndReply('k', "up"); }
+static void httpHandleZero()    { resetTiltIfActive(); httpRunAndReply('k', "zero"); }
 
 static void httpHandleOptions() {
   httpServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -343,8 +531,9 @@ static void httpHandleOptions() {
 
 static void httpHandleRoot() {
   String body = String("Petoi ") + httpModelName() +
-                " HTTP control. Endpoints: GET /status, GET /skills, "
-                "POST /skill, POST /cmd, POST /move, POST /tilt, POST /euler, POST /beep, "
+                " HTTP control. Endpoints: GET /status, GET /version, GET /skills, "
+                "POST /skill, POST /cmd, POST /move, POST /tilt, POST /euler, POST /nav, "
+                "GET /pid, POST /pid, POST /beep, "
                 "POST /gyro, POST /speed, POST /stop, POST /rest, POST /balance, "
                 "POST /up, POST /zero";
   httpServer.send(200, "text/plain", body);
@@ -355,12 +544,16 @@ static void httpHandleRoot() {
 static void httpServerTask(void *) {
   httpServer.on("/", HTTP_GET, httpHandleRoot);
   httpServer.on("/status", HTTP_GET, httpHandleStatus);
+  httpServer.on("/version", HTTP_GET, httpHandleVersion);
   httpServer.on("/skills", HTTP_GET, httpHandleSkills);
   httpServer.on("/skill", HTTP_POST, httpHandleSkill);
   httpServer.on("/cmd", HTTP_POST, httpHandleCmd);
   httpServer.on("/move", HTTP_POST, httpHandleMove);
   httpServer.on("/tilt", HTTP_POST, httpHandleTilt);
   httpServer.on("/euler", HTTP_POST, httpHandleEuler);
+  httpServer.on("/nav", HTTP_POST, httpHandleNav);
+  httpServer.on("/pid", HTTP_GET, httpHandlePidGet);
+  httpServer.on("/pid", HTTP_POST, httpHandlePidPost);
   httpServer.on("/beep", HTTP_POST, httpHandleBeep);
   httpServer.on("/gyro", HTTP_POST, httpHandleGyro);
   httpServer.on("/speed", HTTP_POST, httpHandleSpeed);
@@ -382,6 +575,10 @@ static void httpServerTask(void *) {
 
   for (;;) {
     httpServer.handleClient();
+    if (millis() - pidLastTickMs >= PID_PERIOD_MS) {
+      pidLastTickMs = millis();
+      runPidTick();
+    }
     vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
