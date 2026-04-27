@@ -21,10 +21,12 @@ This fork adds an HTTP control layer (port 80) alongside the existing WebSocket 
 
 ```sh
 curl http://<robot-ip>/status                                   # board info
+curl http://<robot-ip>/version                                  # firmware build time
 curl http://<robot-ip>/skills                                   # live skill list
 curl -X POST http://<robot-ip>/up                               # stand up
 curl -X POST http://<robot-ip>/skill -d '{"name":"sit"}'        # sit
-curl -X POST http://<robot-ip>/skill -d '{"name":"wkF"}'        # walk forward
+curl -X POST http://<robot-ip>/nav -d '{"vx":0.1}'              # walk forward
+curl -X POST http://<robot-ip>/euler -d '{"pitch":-0.15}'       # squat rear, head up
 curl -X POST http://<robot-ip>/rest                             # power down
 ```
 
@@ -33,17 +35,34 @@ curl -X POST http://<robot-ip>/rest                             # power down
 | Method | Path | Body | What it does |
 |---|---|---|---|
 | `GET`  | `/status`  | — | `{model, ip, rssi, uptimeMs, busy, wsClients, freeHeap}` |
+| `GET`  | `/version` | — | `{buildDate, buildTime, model}` — confirm what's flashed |
 | `GET`  | `/skills`  | — | Live `{postures:[], gaits:[], behaviors:[]}` read from firmware |
+| `GET`  | `/pid`     | — | `{kp, ki, kd, active, targetDeg, currentDeg}` — pitch PID state |
 | `POST` | `/skill`   | `{"name":"sit","arg":0}` | Run a named skill (`arg` optional, e.g. repeat count) |
 | `POST` | `/cmd`     | `{"raw":"ksit"}` or `{"token":"t","args":"10 -5"}` | Raw passthrough for any OpenCat token |
 | `POST` | `/move`    | `{"joints":[{"index":8,"angle":30}], "mode":"simultaneous"\|"sequential"}` | Move specific joints |
-| `POST` | `/tilt`    | `{"roll":10,"pitch":-5}` | Tilt the body |
+| `POST` | `/euler`   | `{"roll":<rad>, "pitch":<rad>, "yaw":<rad>}` | Body orientation. Pitch ∈ [-0.2, 0.5], roll ∈ [-0.4, 0.4], yaw ∈ [-1.0, 1.0]. Roll uses IMU loop; pitch uses direct knee+hip fold + closed-loop PID (5 Hz, IMU-feedback); yaw drives head pan (joint 0, +=left). |
+| `POST` | `/nav`     | `{"vx":<m/s>, "vy":<m/s>, "vyaw":<rad/s>}` | Body-frame velocity → closest gait. `vy` is ignored (no native lateral). Magnitudes only act as dead-zones; use `/speed` to change gait speed. |
+| `POST` | `/pid`     | `{"kp":1.0,"ki":0.2,"kd":0.5}` (any subset) | Live-tune the pitch PID gains |
 | `POST` | `/beep`    | `{"notes":[[60,4],[62,4]]}` | Play notes (MIDI number + duration) |
 | `POST` | `/gyro`    | `{}` | Toggle IMU-based balancing |
 | `POST` | `/speed`   | `{"delta":1}` or `{"delta":-2}` | Speed up / slow down |
-| `POST` | `/stop`, `/rest`, `/balance`, `/up`, `/zero` | — | Convenience wrappers → `/skill` |
+| `POST` | `/tilt`    | `{"roll":10,"pitch":-5}` | **Buggy — use `/euler` instead.** Misparses inputs against the firmware's `t axis angle` format. |
+| `POST` | `/stop`, `/rest`, `/balance`, `/up`, `/zero` | — | Convenience wrappers → `/skill`. Also stop the pitch PID if active. |
 
-All POSTs return `{ok:true, token, cmd, durationMs, response}` on success, or `{ok:false, error:"busy"|"timeout"|"bad_request"}` with HTTP 4xx.
+All POSTs return `{ok:true, token, cmd, durationMs, response}` on success, or `{ok:false, error:"busy"|"timeout"|"bad_request"|"out_of_range", detail:"…"}` with HTTP 4xx.
+
+### `/euler` — body pose with closed-loop pitch
+
+- **Roll** is open-loop through the firmware's IMU balance loop (sets `yprTilt[2]`).
+- **Pitch** sets a setpoint that a layered PID drives by folding rear knees + hips (negative pitch / head up) or front knees + hips (positive pitch / head down). The IMU's pitch correction is suppressed while `/euler` holds a non-zero pitch; the PID re-issues the joint frame at 5 Hz to track the setpoint and refresh servos against thermal droop.
+- **Yaw** drives joint 0 (head pan) directly. Positive yaw = head left.
+- Calling `/balance`, `/up`, `/rest`, `/stop`, `/zero`, `/skill`, or `/nav` cleanly stops the PID and re-enables the firmware's pitch IMU loop.
+- **Hardware caveat**: at large negative pitch, the front legs carry the body weight and may thermally throttle after 5–10 s, causing the chassis to drop. Stay below `pitch=-0.15` for sustained holds.
+
+### `/nav` — discrete-gait velocity command
+
+The robot only supports a fixed set of gait skills (`wkF`, `wkL`, `wkR`, `bk`, `bkL`, `bkR`, `balance`), so `/nav` maps `(vx, vyaw)` to the closest one rather than producing a continuous velocity. `vy` (lateral) has no native equivalent on these quadrupeds and is dropped. Magnitudes only matter as a dead-zone. Use `/speed {"delta":±N}` to adjust gait speed and `/euler` to lean while walking.
 
 ### Skill library (Bittle, ~93 skills)
 
