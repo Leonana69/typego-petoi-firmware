@@ -72,6 +72,24 @@ static bool runHttpCommandBlocking(char tk, const char *args, size_t argLen,
   return ok;
 }
 
+// Claim the dispatch slot, write command globals, and return immediately
+// without waiting for reaction() to consume them. Used by /control, which is
+// a high-rate channel: HttpTransport on the Python side uses a 0.5 s timeout
+// and fires every ~100 ms during follow loops, so blocking the reply on
+// command completion would drop frames. Long-running skills continue in the
+// background; new /control calls during their tail get 409.
+static bool httpFireAndForget(char tk, const char *args, size_t argLen) {
+  if (argLen > (size_t)BUFF_LEN) return false;
+  if (!httpTryClaim()) return false;
+  token = tk;
+  if (argLen > 0) memcpy(newCmd, args, argLen);
+  cmdLen = argLen;
+  newCmd[argLen] = (tk >= 'A' && tk <= 'Z') ? '~' : '\0';
+  newCmdIdx = 4;
+  webResponse = "";
+  return true;
+}
+
 // True once /euler has set a non-zero pitch or roll. Cleared by
 // resetTiltIfActive(), which gait-bound dispatches (/nav, /skill) call so a
 // leftover lean from a prior /euler doesn't fight the gait.
@@ -384,40 +402,26 @@ static void runPidTick() {
 #define EULER_YAW_ABS_RAD   1.0f
 #define EULER_YAW_CLAMP_DEG 50  // joint-0 (head pan) hardware-safe range
 
-// POST /euler {"roll": <rad>, "pitch": <rad>, "yaw": <rad>}
-// Roll uses the IMU balance loop via yprTilt[2] (direct write — no dispatch).
-// Pitch arms the PID task; this handler dispatches the initial open-loop pose
-// so the user sees motion immediately, then the PID continues at 5 Hz.
-// Yaw drives joint 0 (head pan) — positive = head left (ROS convention).
-static void httpHandleEuler() {
-  JsonDocument req;
-  if (deserializeJson(req, httpBody())) {
-    httpSendError(400, "bad_request", "invalid JSON");
-    return;
-  }
-  float rollRad = req["roll"] | 0.0f;
-  float pitchRad = req["pitch"] | 0.0f;
-  float yawRad = req["yaw"] | 0.0f;
+// Validate /euler ranges, write PID + tilt state, and build the i-token args
+// for the initial open-loop pose. Shared by /euler (blocking) and /control
+// (fire-and-forget). Returns 0 on success; otherwise an HTTP error code with
+// errMsg populated. State writes happen only on success.
+static int prepareEulerArgs(float rollRad, float pitchRad, float yawRad,
+                            String &outArgs, char *errMsg, size_t errCap) {
   if (pitchRad < EULER_PITCH_MIN_RAD || pitchRad > EULER_PITCH_MAX_RAD) {
-    char msg[80];
-    snprintf(msg, sizeof(msg), "pitch=%.3f out of range [%.2f, %.2f]",
+    snprintf(errMsg, errCap, "pitch=%.3f out of range [%.2f, %.2f]",
              pitchRad, EULER_PITCH_MIN_RAD, EULER_PITCH_MAX_RAD);
-    httpSendError(400, "out_of_range", msg);
-    return;
+    return 400;
   }
   if (rollRad < -EULER_ROLL_ABS_RAD || rollRad > EULER_ROLL_ABS_RAD) {
-    char msg[80];
-    snprintf(msg, sizeof(msg), "roll=%.3f out of range [%.2f, %.2f]",
+    snprintf(errMsg, errCap, "roll=%.3f out of range [%.2f, %.2f]",
              rollRad, -EULER_ROLL_ABS_RAD, EULER_ROLL_ABS_RAD);
-    httpSendError(400, "out_of_range", msg);
-    return;
+    return 400;
   }
   if (yawRad < -EULER_YAW_ABS_RAD || yawRad > EULER_YAW_ABS_RAD) {
-    char msg[80];
-    snprintf(msg, sizeof(msg), "yaw=%.3f out of range [%.2f, %.2f]",
+    snprintf(errMsg, errCap, "yaw=%.3f out of range [%.2f, %.2f]",
              yawRad, -EULER_YAW_ABS_RAD, EULER_YAW_ABS_RAD);
-    httpSendError(400, "out_of_range", msg);
-    return;
+    return 400;
   }
   int rollDeg = constrain((int)lroundf(rollRad * RAD_TO_DEG), -127, 127);
   int yawDeg = constrain((int)lroundf(yawRad * RAD_TO_DEG),
@@ -435,7 +439,31 @@ static void httpHandleEuler() {
   // Prepend joint 0 (head pan) for yaw. The `i`-token sets targetHead[0] and
   // manualHeadQ=true so subsequent perform() iterations hold this angle. PID
   // ticks dispatch only legs (8..15), so targetHead[0] persists between them.
-  String iArgs = "0 " + String(yawDeg) + " " + eulerJointArgs(openFold);
+  outArgs = "0 " + String(yawDeg) + " " + eulerJointArgs(openFold);
+  return 0;
+}
+
+// POST /euler {"roll": <rad>, "pitch": <rad>, "yaw": <rad>}
+// Roll uses the IMU balance loop via yprTilt[2] (direct write — no dispatch).
+// Pitch arms the PID task; this handler dispatches the initial open-loop pose
+// so the user sees motion immediately, then the PID continues at 5 Hz.
+// Yaw drives joint 0 (head pan) — positive = head left (ROS convention).
+static void httpHandleEuler() {
+  JsonDocument req;
+  if (deserializeJson(req, httpBody())) {
+    httpSendError(400, "bad_request", "invalid JSON");
+    return;
+  }
+  float rollRad = req["roll"] | 0.0f;
+  float pitchRad = req["pitch"] | 0.0f;
+  float yawRad = req["yaw"] | 0.0f;
+  String iArgs;
+  char err[80] = {0};
+  int code = prepareEulerArgs(rollRad, pitchRad, yawRad, iArgs, err, sizeof(err));
+  if (code != 0) {
+    httpSendError(code, "out_of_range", err);
+    return;
+  }
   httpRunAndReply('i', iArgs);
 }
 
@@ -467,10 +495,20 @@ static void httpHandlePidPost() {
   httpSendPidJson();
 }
 
+// Map a body-frame velocity command to a gait skill name. Shared by /nav
+// (blocking) and /control (fire-and-forget). vy is ignored — quadruped gaits
+// in this firmware have no native lateral translation. Magnitudes are only
+// used as a dead-zone; speed is set separately via /speed.
+static const char *chooseNavSkill(float vx, float vyaw) {
+  const float LIN_DEAD = 0.05f;
+  const float ANG_DEAD = 0.1f;
+  if (fabsf(vx) < LIN_DEAD && fabsf(vyaw) < ANG_DEAD) return "balance";
+  if (vx > LIN_DEAD)  return (vyaw > ANG_DEAD) ? "wkL" : (vyaw < -ANG_DEAD) ? "wkR" : "wkF";
+  if (vx < -LIN_DEAD) return (vyaw > ANG_DEAD) ? "bkL" : (vyaw < -ANG_DEAD) ? "bkR" : "bk";
+  return (vyaw > 0) ? "wkL" : "wkR";
+}
+
 // POST /nav {"vx": <m/s>, "vy": <m/s>, "vyaw": <rad/s>}
-// Maps a body-frame velocity command to the closest gait skill. vy is ignored
-// — quadruped gaits in this firmware have no native lateral translation.
-// Magnitudes are only used as a dead-zone; speed is set separately via /speed.
 static void httpHandleNav() {
   JsonDocument req;
   if (deserializeJson(req, httpBody())) {
@@ -479,19 +517,7 @@ static void httpHandleNav() {
   }
   float vx = req["vx"] | 0.0f;
   float vyaw = req["vyaw"] | 0.0f;
-
-  const float LIN_DEAD = 0.05f;
-  const float ANG_DEAD = 0.1f;
-  const char *skill;
-  if (fabsf(vx) < LIN_DEAD && fabsf(vyaw) < ANG_DEAD) {
-    skill = "balance";
-  } else if (vx > LIN_DEAD) {
-    skill = (vyaw > ANG_DEAD) ? "wkL" : (vyaw < -ANG_DEAD) ? "wkR" : "wkF";
-  } else if (vx < -LIN_DEAD) {
-    skill = (vyaw > ANG_DEAD) ? "bkL" : (vyaw < -ANG_DEAD) ? "bkR" : "bk";
-  } else {
-    skill = (vyaw > 0) ? "wkL" : "wkR";
-  }
+  const char *skill = chooseNavSkill(vx, vyaw);
   resetTiltIfActive();
   httpRunAndReply('k', String(skill));
 }
@@ -558,6 +584,72 @@ static void httpHandleBalance() { resetTiltIfActive(); httpRunAndReply('k', "bal
 static void httpHandleUp()      { resetTiltIfActive(); httpRunAndReply('k', "up"); }
 static void httpHandleZero()    { resetTiltIfActive(); httpRunAndReply('k', "zero"); }
 
+// POST /control {"command": "<name>", ...}
+// Unified high-rate control channel for clients that prefer one endpoint over
+// many RESTful routes. Reuses the same JSON keys (vx/vy/vyaw, roll/pitch/yaw)
+// that /nav and /euler accept, so a Python translator layer isn't needed.
+//
+// Replies {"ok":true} as soon as the dispatch slot is claimed — does NOT wait
+// for the gait/skill to finish (HttpTransport's 0.5 s timeout would drop
+// frames otherwise). If the previous command is still running, returns 409.
+static void httpHandleControl() {
+  JsonDocument doc;
+  if (deserializeJson(doc, httpBody())) {
+    httpSendJson(400, "{\"ok\":false,\"error\":\"bad_json\"}");
+    return;
+  }
+  const char *cmd = doc["command"] | "";
+
+  char tk = 0;
+  String args;
+  // For skill loads, /control commands map to firmware skill names. The
+  // RESTful aliases (stop/rest/balance/up) keep the same mapping.
+  if (!strcmp(cmd, "stop") || !strcmp(cmd, "sit_down") || !strcmp(cmd, "rest")) {
+    resetTiltIfActive();
+    tk = 'k'; args = "rest";
+  } else if (!strcmp(cmd, "stand_up") || !strcmp(cmd, "up")) {
+    resetTiltIfActive();
+    tk = 'k'; args = "up";
+  } else if (!strcmp(cmd, "stretch")) {
+    resetTiltIfActive();
+    tk = 'k'; args = "str";
+  } else if (!strcmp(cmd, "balance")) {
+    resetTiltIfActive();
+    tk = 'k'; args = "balance";
+  } else if (!strcmp(cmd, "nav")) {
+    float vx = doc["vx"] | 0.0f;
+    float vyaw = doc["vyaw"] | 0.0f;
+    resetTiltIfActive();
+    tk = 'k'; args = chooseNavSkill(vx, vyaw);
+  } else if (!strcmp(cmd, "euler")) {
+    float rollRad = doc["roll"] | 0.0f;
+    float pitchRad = doc["pitch"] | 0.0f;
+    float yawRad = doc["yaw"] | 0.0f;
+    char err[80] = {0};
+    int code = prepareEulerArgs(rollRad, pitchRad, yawRad, args, err, sizeof(err));
+    if (code != 0) {
+      JsonDocument resp;
+      resp["ok"] = false;
+      resp["error"] = "out_of_range";
+      resp["detail"] = err;
+      String out;
+      serializeJson(resp, out);
+      httpSendJson(code, out);
+      return;
+    }
+    tk = 'i';
+  } else {
+    httpSendJson(400, "{\"ok\":false,\"error\":\"unknown_command\"}");
+    return;
+  }
+
+  if (!httpFireAndForget(tk, args.c_str(), args.length())) {
+    httpSendJson(409, "{\"ok\":false,\"error\":\"busy\"}");
+    return;
+  }
+  httpSendJson(200, "{\"ok\":true}");
+}
+
 static void httpHandleOptions() {
   httpServer.sendHeader("Access-Control-Allow-Origin", "*");
   httpServer.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -571,7 +663,7 @@ static void httpHandleRoot() {
                 "POST /skill, POST /cmd, POST /move, POST /tilt, POST /euler, POST /nav, "
                 "GET /pid, POST /pid, POST /beep, "
                 "POST /gyro, POST /speed, POST /stop, POST /rest, POST /balance, "
-                "POST /up, POST /zero";
+                "POST /up, POST /zero, POST /control";
   httpServer.send(200, "text/plain", body);
 }
 
@@ -598,6 +690,8 @@ static void httpServerTask(void *) {
   httpServer.on("/balance", HTTP_POST, httpHandleBalance);
   httpServer.on("/up", HTTP_POST, httpHandleUp);
   httpServer.on("/zero", HTTP_POST, httpHandleZero);
+  httpServer.on("/control", HTTP_POST, httpHandleControl);
+  httpServer.on("/control", HTTP_OPTIONS, httpHandleOptions);
   httpServer.onNotFound([]() { httpSendError(404, "not_found"); });
   // Simple CORS preflight for every route.
   httpServer.on("/status", HTTP_OPTIONS, httpHandleOptions);

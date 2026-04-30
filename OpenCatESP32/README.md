@@ -28,6 +28,11 @@ curl -X POST http://<robot-ip>/skill -d '{"name":"sit"}'        # sit
 curl -X POST http://<robot-ip>/nav -d '{"vx":0.1}'              # walk forward
 curl -X POST http://<robot-ip>/euler -d '{"pitch":-0.15}'       # squat rear, head up
 curl -X POST http://<robot-ip>/rest                             # power down
+
+# Unified high-rate channel — one endpoint, switches on `command`
+curl -X POST http://<robot-ip>/control -d '{"command":"nav","vx":0.2,"vyaw":0.3}'
+curl -X POST http://<robot-ip>/control -d '{"command":"euler","pitch":0.2,"yaw":0.5}'
+curl -X POST http://<robot-ip>/control -d '{"command":"stand_up"}'
 ```
 
 ### Endpoints
@@ -49,8 +54,9 @@ curl -X POST http://<robot-ip>/rest                             # power down
 | `POST` | `/speed`   | `{"delta":1}` or `{"delta":-2}` | Speed up / slow down |
 | `POST` | `/tilt`    | `{"roll":10,"pitch":-5}` | **Buggy — use `/euler` instead.** Misparses inputs against the firmware's `t axis angle` format. |
 | `POST` | `/stop`, `/rest`, `/balance`, `/up`, `/zero` | — | Convenience wrappers → `/skill`. Also stop the pitch PID if active. |
+| `POST` | `/control` | `{"command":"<name>", ...}` | Unified high-rate channel — see [`/control`](#control--unified-high-rate-channel) below. |
 
-All POSTs return `{ok:true, token, cmd, durationMs, response}` on success, or `{ok:false, error:"busy"|"timeout"|"bad_request"|"out_of_range", detail:"…"}` with HTTP 4xx.
+The RESTful POSTs return `{ok:true, token, cmd, durationMs, response}` on success, or `{ok:false, error:"busy"|"timeout"|"bad_request"|"out_of_range", detail:"…"}` with HTTP 4xx. `/control` returns the smaller `{ok:true}` / `{ok:false, error:"…"}` shape — see its section.
 
 ### `/euler` — body pose with closed-loop pitch
 
@@ -63,6 +69,32 @@ All POSTs return `{ok:true, token, cmd, durationMs, response}` on success, or `{
 ### `/nav` — discrete-gait velocity command
 
 The robot only supports a fixed set of gait skills (`wkF`, `wkL`, `wkR`, `bk`, `bkL`, `bkR`, `balance`), so `/nav` maps `(vx, vyaw)` to the closest one rather than producing a continuous velocity. `vy` (lateral) has no native equivalent on these quadrupeds and is dropped. Magnitudes only matter as a dead-zone. Use `/speed {"delta":±N}` to adjust gait speed and `/euler` to lean while walking.
+
+### `/control` — unified high-rate channel
+
+One endpoint that switches on a `command` field and dispatches to the same logic as `/nav`, `/euler`, and the skill-load wrappers. Useful for clients that prefer a single route and a higher command rate (e.g. teleop loops at ~10 Hz). The RESTful endpoints above are still available — `/control` doesn't replace them.
+
+Two semantic differences from the RESTful endpoints:
+
+- **Non-blocking.** Returns `{ok:true}` the moment the command is dispatched; does not wait for the gait/skill to finish. This matches a 0.5 s client timeout in tight follow loops, but it means a long-running skill (e.g. `up` from `rest` takes ~1–2 s) holds the dispatch slot — calls arriving during its tail get HTTP `409 {"ok":false,"error":"busy"}`.
+- **Smaller reply.** Just `{ok:true}` on success or `{ok:false, error:"bad_json"|"unknown_command"|"out_of_range"|"busy", detail:"…"}` on failure. No `token`/`durationMs`/`response` (since those need waiting for completion).
+
+Accepted commands and their dispatch:
+
+| `command` | What it dispatches |
+|---|---|
+| `stop`, `sit_down`, `rest`     | Skill `rest` |
+| `stand_up`, `up`               | Skill `up` |
+| `stretch`                       | Skill `str` |
+| `balance`                       | Skill `balance` |
+| `nav`                           | Same as POST `/nav`. JSON keys: `vx` (m/s), `vy` (m/s, ignored), `vyaw` (rad/s). |
+| `euler`                         | Same as POST `/euler`. JSON keys: `roll` (rad), `pitch` (rad), `yaw` (rad). Same range checks. |
+
+```sh
+curl -X POST http://<robot-ip>/control -d '{"command":"nav","vx":0.2,"vy":0.0,"vyaw":0.0}'
+curl -X POST http://<robot-ip>/control -d '{"command":"euler","roll":0.0,"pitch":0.2,"yaw":0.5}'
+curl -X POST http://<robot-ip>/control -d '{"command":"stop"}'
+```
 
 ### Skill library (Bittle, ~93 skills)
 
@@ -107,7 +139,7 @@ Source of truth is `GET /skills` — it reads the firmware's `skillNameWithType[
 ### Caveats
 
 - **One command at a time.** HTTP and the built-in WebSocket share a single dispatch slot. A second request during motion returns `409 busy` — wait and retry.
-- **Blocking semantics.** POST `/skill` doesn't return until the skill finishes (or 30 s timeout). Fine for scripting; don't open dozens of parallel connections.
+- **Blocking semantics.** RESTful POSTs (`/skill`, `/nav`, `/euler`, …) don't return until the command finishes (or 30 s timeout). Fine for scripting; don't open dozens of parallel connections. Use `/control` for high-rate teleop where waiting for completion would drop frames.
 - **Model-specific.** Names above are Bittle. Swap `#define BITTLE` for `NYBBLE` / `CUB` in `OpenCatESP32.ino` and rebuild — `GET /skills` will reflect the new set.
 
 ---
