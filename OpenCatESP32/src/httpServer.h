@@ -13,6 +13,13 @@
 #define HTTP_PORT 80
 #define HTTP_CMD_TIMEOUT_MS 30000
 #define HTTP_TASK_STACK 4096
+// Open-loop calibration for /walk. The wkF/bk gait advances at roughly this
+// speed at the default /speed multiplier — surface, battery, and gait shifts
+// all change it, so callers can override per call via the "speed" field.
+// Quadrupeds have no encoders and IMU acceleration integration drifts too
+// fast to be useful for distance, so /walk is fundamentally a time-times-
+// speed estimate. /rotate is IMU-closed-loop and does not use this.
+#define WALK_DEFAULT_SPEED_MPS 0.07f
 // Pin to core 1 (Arduino loop core). Core 0 is shared by BLE + WiFi stacks —
 // leaving heap/CPU headroom there avoids std::bad_alloc during BLE scan.
 #define HTTP_TASK_CORE 1
@@ -505,7 +512,7 @@ static const char *chooseNavSkill(float vx, float vyaw) {
   if (fabsf(vx) < LIN_DEAD && fabsf(vyaw) < ANG_DEAD) return "balance";
   if (vx > LIN_DEAD)  return (vyaw > ANG_DEAD) ? "wkL" : (vyaw < -ANG_DEAD) ? "wkR" : "wkF";
   if (vx < -LIN_DEAD) return (vyaw > ANG_DEAD) ? "bkL" : (vyaw < -ANG_DEAD) ? "bkR" : "bk";
-  return (vyaw > 0) ? "wkL" : "wkR";
+  return (vyaw > 0) ? "vtL" : "vtR";
 }
 
 // POST /nav {"vx": <m/s>, "vy": <m/s>, "vyaw": <rad/s>}
@@ -520,6 +527,127 @@ static void httpHandleNav() {
   const char *skill = chooseNavSkill(vx, vyaw);
   resetTiltIfActive();
   httpRunAndReply('k', String(skill));
+}
+
+// POST /rotate {"yaw": <rad>, "timeout_ms"?: <int>, "tolerance_deg"?: <float>}
+// Closed-loop yaw control: dispatches vtL/vtR, polls IMU `ypr[0]` with
+// wrap-around handling, then dispatches "balance" once the accumulated yaw
+// reaches the target or the timeout expires. Direction convention: positive
+// yaw → vtL. If your IMU is wired with the opposite sign, the bot will turn
+// the wrong way and time out — flip the sign on the caller side.
+static void httpHandleRotate() {
+  JsonDocument req;
+  if (deserializeJson(req, httpBody())) {
+    httpSendError(400, "bad_request", "invalid JSON");
+    return;
+  }
+  float deltaRad = req["yaw"] | 0.0f;
+  unsigned long timeoutMs = req["timeout_ms"] | 10000UL;
+  float toleranceDeg = req["tolerance_deg"] | 5.0f;
+  if (timeoutMs > 30000UL) timeoutMs = 30000UL;
+  if (timeoutMs < 100UL) timeoutMs = 100UL;
+  if (toleranceDeg < 1.0f) toleranceDeg = 1.0f;
+
+  float deltaDeg = deltaRad * RAD_TO_DEG;
+  if (fabsf(deltaDeg) < toleranceDeg) {
+    resetTiltIfActive();
+    httpRunAndReply('k', "balance");
+    return;
+  }
+
+  resetTiltIfActive();
+  const char *skill = (deltaDeg > 0) ? "vtL" : "vtR";
+  String dispatchResp;
+  if (!runHttpCommandBlocking('k', skill, strlen(skill), dispatchResp, 2000)) {
+    if (webTaskActive) httpSendError(409, "busy", "another web task is running");
+    else httpSendError(408, "timeout", "could not dispatch rotation skill");
+    return;
+  }
+
+  unsigned long t0 = millis();
+  float prevYaw = ypr[0];
+  float accumDeg = 0;
+  bool reached = false;
+
+  while (millis() - t0 < timeoutMs) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+    float curYaw = ypr[0];
+    float step = curYaw - prevYaw;
+    if (step > 180.0f)  step -= 360.0f;
+    if (step < -180.0f) step += 360.0f;
+    accumDeg += step;
+    prevYaw = curYaw;
+
+    if (deltaDeg > 0 && accumDeg >= deltaDeg - toleranceDeg) { reached = true; break; }
+    if (deltaDeg < 0 && accumDeg <= deltaDeg + toleranceDeg) { reached = true; break; }
+  }
+
+  String balResp;
+  runHttpCommandBlocking('k', "balance", strlen("balance"), balResp, 2000);
+
+  JsonDocument resp;
+  resp["ok"] = true;
+  resp["reached"] = reached;
+  resp["target_deg"] = deltaDeg;
+  resp["actual_deg"] = accumDeg;
+  resp["elapsed_ms"] = (uint32_t)(millis() - t0);
+  String out;
+  serializeJson(resp, out);
+  httpSendJson(200, out);
+}
+
+// POST /walk {"distance": <m>, "speed"?: <m/s>, "timeout_ms"?: <int>}
+// Open-loop time-based walking. duration = |distance| / speed; runs wkF for
+// positive distance, bk for negative, then dispatches "balance". This is
+// fundamentally an estimate — see WALK_DEFAULT_SPEED_MPS comment.
+static void httpHandleWalk() {
+  JsonDocument req;
+  if (deserializeJson(req, httpBody())) {
+    httpSendError(400, "bad_request", "invalid JSON");
+    return;
+  }
+  float distance = req["distance"] | 0.0f;
+  float speed = req["speed"] | WALK_DEFAULT_SPEED_MPS;
+  if (speed <= 0.005f) {
+    httpSendError(400, "bad_request", "speed must be > 0.005 m/s");
+    return;
+  }
+  unsigned long durationMs = (unsigned long)(fabsf(distance) / speed * 1000.0f);
+  unsigned long timeoutMs = req["timeout_ms"] | (durationMs + 2000UL);
+  if (timeoutMs > 60000UL) timeoutMs = 60000UL;
+  if (durationMs > timeoutMs) durationMs = timeoutMs;
+
+  if (durationMs < 100UL) {
+    resetTiltIfActive();
+    httpRunAndReply('k', "balance");
+    return;
+  }
+
+  resetTiltIfActive();
+  const char *skill = (distance >= 0) ? "wkF" : "bk";
+  String dispatchResp;
+  if (!runHttpCommandBlocking('k', skill, strlen(skill), dispatchResp, 2000)) {
+    if (webTaskActive) httpSendError(409, "busy", "another web task is running");
+    else httpSendError(408, "timeout", "could not dispatch walk skill");
+    return;
+  }
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < durationMs) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+
+  String balResp;
+  runHttpCommandBlocking('k', "balance", strlen("balance"), balResp, 2000);
+
+  JsonDocument resp;
+  resp["ok"] = true;
+  resp["target_distance"] = distance;
+  resp["assumed_speed"] = speed;
+  resp["elapsed_ms"] = (uint32_t)(millis() - t0);
+  String out;
+  serializeJson(resp, out);
+  httpSendJson(200, out);
 }
 
 static void httpHandleBeep() {
@@ -661,6 +789,7 @@ static void httpHandleRoot() {
   String body = String("Petoi ") + httpModelName() +
                 " HTTP control. Endpoints: GET /status, GET /version, GET /skills, "
                 "POST /skill, POST /cmd, POST /move, POST /tilt, POST /euler, POST /nav, "
+                "POST /rotate, POST /walk, "
                 "GET /pid, POST /pid, POST /beep, "
                 "POST /gyro, POST /speed, POST /stop, POST /rest, POST /balance, "
                 "POST /up, POST /zero, POST /control";
@@ -680,6 +809,8 @@ static void httpServerTask(void *) {
   httpServer.on("/tilt", HTTP_POST, httpHandleTilt);
   httpServer.on("/euler", HTTP_POST, httpHandleEuler);
   httpServer.on("/nav", HTTP_POST, httpHandleNav);
+  httpServer.on("/rotate", HTTP_POST, httpHandleRotate);
+  httpServer.on("/walk", HTTP_POST, httpHandleWalk);
   httpServer.on("/pid", HTTP_GET, httpHandlePidGet);
   httpServer.on("/pid", HTTP_POST, httpHandlePidPost);
   httpServer.on("/beep", HTTP_POST, httpHandleBeep);
