@@ -25,5 +25,11 @@ void setup() {
 }
 
 void loop() {
-  delay(1000);
+  // Print the WiFi signal strength at 0.5 Hz (every 2 s).
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+  } else {
+    Serial.println("RSSI: not connected");
+  }
+  delay(2000);
 }
