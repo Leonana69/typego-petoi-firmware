@@ -1,6 +1,6 @@
 # esp32-xiao-cam-stream
 
-MJPEG camera streaming firmware for the Seeed **XIAO ESP32S3 Sense**. After
+MJPEG camera streaming firmware for the **AI-Thinker ESP32-CAM**. After
 boot, the board connects to a known WiFi AP and serves an MJPEG stream at
 `http://<board-ip>/`.
 
@@ -39,9 +39,9 @@ arduino-cli core update-index
 arduino-cli core install esp32:esp32
 ```
 
-Confirm the XIAO ESP32S3 board is visible:
+Confirm the ESP32-CAM board is visible:
 ```sh
-arduino-cli board listall | grep XIAO_ESP32S3
+arduino-cli board listall | grep esp32cam
 ```
 
 No extra libraries are required — `WiFi`, `esp_camera`, and `esp_http_server`
@@ -49,21 +49,26 @@ all ship with the ESP32 core.
 
 ## Build & flash
 
+The ESP32-CAM has no onboard USB. Either seat it on an **ESP32-CAM-MB**
+programmer (auto-reset, no jumpers) or wire a 3.3 V USB-to-serial adapter to
+`U0T`/`U0R`/`GND` and pull **IO0 to GND** during reset to enter the bootloader
+(release IO0 and reset to run).
+
 From this directory (`esp32-xiao-cam-stream/`):
 
 ```sh
-make build   # arduino-cli compile with PSRAM=opi
-make flash   # upload to the first /dev/cu.usbmodem* and open a 115200 serial monitor
+make build   # arduino-cli compile for esp32:esp32:esp32cam
+make flash   # upload over the USB-serial adapter and open a 115200 serial monitor
 ```
 
 Or call `arduino-cli` directly:
 ```sh
-arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi .
-arduino-cli upload  --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi -p /dev/cu.usbmodem* .
+arduino-cli compile --fqbn esp32:esp32:esp32cam .
+arduino-cli upload  --fqbn esp32:esp32:esp32cam -p /dev/cu.usbserial-XXXX .
 ```
 
-PSRAM **must** be enabled (`PSRAM=opi`) — the camera config allocates two
-JPEG frame buffers in PSRAM.
+PSRAM is enabled by the `esp32cam` board definition — the camera config
+allocates two JPEG frame buffers in PSRAM.
 
 ## Configure WiFi
 
@@ -80,7 +85,7 @@ match (preference = declaration order).
 
 ```
 esp32-xiao-cam-stream.ino   # setup() / loop()
-src/camera_pins.h           # XIAO ESP32S3 Sense camera pinout
+src/camera_pins.h           # AI-Thinker ESP32-CAM camera pinout
 src/wifi_conn.h             # scan + connect
 src/camera_stream.h         # esp_camera_init + MJPEG HTTP server
 Makefile                    # build / flash / serial wrappers

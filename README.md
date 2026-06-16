@@ -3,7 +3,7 @@
 Two ESP32 Arduino sketches that share a single WiFi credentials file:
 
 - **`OpenCatESP32/`** — Petoi BiBoard firmware (OpenCat framework) with an added HTTP control server. See [`OpenCatESP32/README.md`](OpenCatESP32/README.md).
-- **`esp32-xiao-cam-stream/`** — XIAO ESP32S3 Sense MJPEG camera streamer. See [`esp32-xiao-cam-stream/README.md`](esp32-xiao-cam-stream/README.md).
+- **`esp32-xiao-cam-stream/`** — AI-Thinker ESP32-CAM MJPEG camera streamer. See [`esp32-xiao-cam-stream/README.md`](esp32-xiao-cam-stream/README.md).
 
 Both sketches build with `arduino-cli` — run `make build` (or `make flash`) inside either subdirectory.
 

@@ -1,6 +1,6 @@
-FQBN := esp32:esp32:XIAO_ESP32S3:PSRAM=opi
+FQBN := esp32:esp32:esp32cam
 SKETCH := .
-PORT := $(shell ls /dev/cu.usbmodem* 2>/dev/null | head -1)
+PORT := $(shell ls /dev/cu.SLAB_USBtoUART /dev/cu.usbserial-* /dev/cu.wchusbserial* /dev/cu.usbmodem* 2>/dev/null | head -1)
 
 all: build
 

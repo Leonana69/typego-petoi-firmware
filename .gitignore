@@ -9,3 +9,6 @@ managed_components/
 .DS_Store
 *.swp
 *~
+
+# Local project instructions (not shared)
+CLAUDE.md
