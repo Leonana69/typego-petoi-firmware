@@ -20,8 +20,7 @@ typedef struct {
 } wifi_network_t;
 
 static const wifi_network_t WIFI_NETWORKS[] = {
-    {"YECL-tplink", "08781550"},
-    {"LEONA",       "64221771"},
+    {"YourSSID", "YourPassword"},
 };
 
 #define NUM_WIFI_NETWORKS (sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]))
