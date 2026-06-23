@@ -7,6 +7,8 @@ Two ESP32 Arduino sketches that share a single WiFi credentials file:
 
 Both sketches build with `arduino-cli` — run `make build` (or `make flash`) inside either subdirectory.
 
+![Petoi hardware setup: ESP32-CAM mounted on the Bittle, sharing 5V & GND](assets/petoi_setup.png)
+
 ## Shared WiFi configuration
 
 Both sketches scan for a known AP at boot and connect to the first match. The credentials list is a single file at the repo root so you only edit it in one place:
